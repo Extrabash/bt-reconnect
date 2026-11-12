@@ -1,0 +1,28 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.btreconnect'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId 'com.btreconnect'
+        minSdk 21
+        // Намеренно старый targetSdk: не нужны runtime-разрешения
+        // и доступно больше скрытых Bluetooth-методов (connect/disconnect).
+        targetSdk 27
+        versionCode 1
+        versionName '1.0'
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+
+    lint {
+        abortOnError false
+        checkReleaseBuilds false
+    }
+}

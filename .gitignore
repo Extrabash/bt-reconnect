@@ -1,0 +1,7 @@
+*.zip
+*:Zone.Identifier
+*.apk
+.gradle/
+build/
+local.properties
+.idea/
