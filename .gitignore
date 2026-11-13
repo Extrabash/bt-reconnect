@@ -1,6 +1,7 @@
 *.zip
 *:Zone.Identifier
 *.apk
+*.keystore
 .gradle/
 build/
 local.properties

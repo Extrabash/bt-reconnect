@@ -82,6 +82,17 @@ public class MainActivity extends Activity {
     /** Куда сейчас идёт звук: адрес устройства, "" — встроенный вывод, null — неизвестно. */
     private String currentOut;
     private boolean receiverRegistered;
+    /** Начатое подключение/отключение, итог которого ещё не показан в строке состояния. */
+    private BluetoothDevice pendingDevice;
+    private boolean pendingConnect;
+
+    private final Runnable pendingTimeout = new Runnable() {
+        @Override
+        public void run() {
+            refresh();
+            checkPending(true);
+        }
+    };
 
     private final Runnable refreshTask = new Runnable() {
         @Override
@@ -204,6 +215,8 @@ public class MainActivity extends Activity {
             receiverRegistered = false;
         }
         ui.removeCallbacks(refreshTask);
+        ui.removeCallbacks(pendingTimeout);
+        pendingDevice = null;
     }
 
     @Override
@@ -264,11 +277,20 @@ public class MainActivity extends Activity {
         if (selected != null) {
             for (int i = 0; i < rows.size(); i++) {
                 if (i != pos && rows.get(i).key().equals(selected)) {
-                    list.setSelection(i);
+                    // сдвигаем строку на высоту добавленных сверху, чтобы секция вывода была видна;
+                    // лишний зазор сверху ListView уберёт сам
+                    View v = list.getSelectedView();
+                    if (v == null) {
+                        list.setSelection(i);
+                    } else {
+                        int y = v.getTop() + (i - pos) * v.getHeight();
+                        list.setSelectionFromTop(i, Math.max(0, Math.min(y, list.getHeight() - v.getHeight())));
+                    }
                     break;
                 }
             }
         }
+        checkPending(false);
     }
 
     // ---------- состояние ----------
@@ -314,9 +336,18 @@ public class MainActivity extends Activity {
         return sb.toString();
     }
 
-    private boolean isConnected(BluetoothDevice d) {
-        if (connectedProfiles(d).length() > 0) return true;
-        try { // скрытый BluetoothDevice.isConnected() — ловит BLE-пульты и т.п.
+    private boolean isAudio(BluetoothDevice d) {
+        try {
+            BluetoothClass c = d.getBluetoothClass();
+            return c != null && c.getMajorDeviceClass() == BluetoothClass.Device.Major.AUDIO_VIDEO;
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    /** Поднят ли радиоканал до устройства (скрытый BluetoothDevice.isConnected()). */
+    private boolean linkUp(BluetoothDevice d) {
+        try {
             Method m = BluetoothDevice.class.getMethod("isConnected");
             return Boolean.TRUE.equals(m.invoke(d));
         } catch (Throwable ignored) {
@@ -324,24 +355,53 @@ public class MainActivity extends Activity {
         }
     }
 
+    private boolean isConnected(BluetoothDevice d) {
+        if (connectedProfiles(d).length() > 0) return true;
+        // Колонка после отключения звука может ещё долго держать радиоканал — подключённой
+        // её это не делает. Для BLE-пультов и т.п. профилей нет, там канал — единственный признак.
+        return !isAudio(d) && linkUp(d);
+    }
+
     // ---------- подключение ----------
 
     private void toggle(BluetoothDevice d) {
-        if (isConnected(d)) {
-            int n = callOnAll("disconnect", d);
-            status.setText(n > 0 ? "Отключаю: " + name(d)
-                    : "Не удалось отключить " + name(d) + " (прошивка не разрешает)");
-        } else {
+        boolean connect = !isConnected(d);
+        if (connect) {
             status.setText("Подключаю: " + name(d) + "…");
             callOnAll("setPriority", d); // на старых Android профиль мог быть выключен
-            int n = callOnAll("connect", d);
-            if (n == 0) {
+            if (callOnAll("connect", d) == 0) {
                 status.setText("Прямое подключение запрещено прошивкой, пробую разбудить: " + name(d) + "…");
                 nudge(d);
             }
+        } else if (callOnAll("disconnect", d) > 0) {
+            status.setText("Отключаю: " + name(d) + "…");
+        } else {
+            status.setText("Не удалось отключить " + name(d) + " (прошивка не разрешает)");
+            scheduleRefresh(1500);
+            return;
         }
+        pendingDevice = d;
+        pendingConnect = connect;
+        ui.removeCallbacks(pendingTimeout);
+        ui.postDelayed(pendingTimeout, 25000);
         scheduleRefresh(1500);
-        ui.postDelayed(refreshTask, 5000);
+    }
+
+    /** Пишет итог начатой операции, когда состояние устройства изменилось (или вышло время). */
+    private void checkPending(boolean giveUp) {
+        if (pendingDevice == null) return;
+        boolean done = isConnected(pendingDevice) == pendingConnect;
+        if (!done && !giveUp) return;
+        String n = name(pendingDevice);
+        if (done) {
+            status.setText((pendingConnect ? "Подключено: " : "Отключено: ") + n);
+        } else {
+            status.setText(pendingConnect
+                    ? "Не подключилось: " + n + ". Проверьте, что устройство включено"
+                    : "Не удалось отключить: " + n);
+        }
+        pendingDevice = null;
+        ui.removeCallbacks(pendingTimeout);
     }
 
     /** Вызывает скрытый метод профиля через рефлексию. Возвращает число профилей, ответивших true. */
@@ -398,8 +458,7 @@ public class MainActivity extends Activity {
                     @Override
                     public void run() {
                         refresh();
-                        status.setText(isConnected(d) ? "Подключено: " + name(d)
-                                : "Не подключилось: " + name(d) + ". Проверьте, что устройство включено");
+                        checkPending(true);
                     }
                 });
             }
@@ -481,10 +540,24 @@ public class MainActivity extends Activity {
         return false;
     }
 
+    /**
+     * Снимает активное A2DP-устройство (Android 9+): колонки остаются подключёнными,
+     * а звук уходит на встроенный вывод.
+     */
+    private boolean clearActive() {
+        try {
+            BluetoothProfile a2dp = proxies.get(BluetoothProfile.A2DP);
+            Method m = a2dp.getClass().getMethod("setActiveDevice", BluetoothDevice.class);
+            return Boolean.TRUE.equals(m.invoke(a2dp, new Object[]{null}));
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
     /** Направляет звук на устройство; null — на встроенный вывод, не разрывая Bluetooth. */
     private void selectOutput(BluetoothDevice target) {
         if (target == null) {
-            status.setText(setMediaForceUse(FORCE_NO_BT_A2DP)
+            status.setText(setMediaForceUse(FORCE_NO_BT_A2DP) || clearActive()
                     ? "Звук: встроенный вывод (динамики / HDMI)"
                     : "Прошивка не даёт переключить вывод. Чтобы вернуть звук на динамики / HDMI, "
                     + "отключите аудиоустройство в списке ниже");
@@ -567,18 +640,18 @@ public class MainActivity extends Activity {
 
             if (row.type == ROW_OUTPUT) {
                 boolean on = (d == null ? "" : d.getAddress()).equals(currentOut);
-                t1.setText((on ? "◉  " : "◯  ") + (d == null ? row.title : name(d)));
+                t1.setText((on ? "◉  " : "○  ") + (d == null ? row.title : name(d)));
                 t2.setText(on ? "звук идёт сюда" : "OK — переключить звук сюда");
                 t2.setTextColor(on ? 0xFF66D17A : 0xFF9AA0A6);
                 return v;
             }
 
             String profiles = connectedProfiles(d);
-            boolean on = profiles.length() > 0 || isConnected(d);
+            boolean on = isConnected(d);
             t1.setText((on ? "●  " : "○  ") + name(d));
             t2.setText(kind(d) + "  ·  "
                     + (on ? "подключено" + (profiles.length() > 0 ? " (" + profiles + ")" : "")
-                    : "не подключено")
+                    : linkUp(d) ? "звук отключён, связь ещё держится" : "не подключено")
                     + "  ·  " + d.getAddress());
             t2.setTextColor(on ? 0xFF66D17A : 0xFF9AA0A6);
             return v;

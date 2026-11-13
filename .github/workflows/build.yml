@@ -12,6 +12,12 @@ jobs:
         with:
           distribution: temurin
           java-version: 17
+      - name: Signing key
+        env:
+          KEYSTORE: ${{ secrets.SIGNING_KEYSTORE_B64 }}
+        run: |
+          test -n "$KEYSTORE" || { echo "::error::Нет секрета SIGNING_KEYSTORE_B64"; exit 1; }
+          echo "$KEYSTORE" | base64 -d > signing.keystore
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.10.2'
