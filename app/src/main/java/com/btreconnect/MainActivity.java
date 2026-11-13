@@ -33,7 +33,8 @@ import java.util.Set;
 import java.util.UUID;
 
 /**
- * Список сопряжённых Bluetooth-устройств с подключением/отключением по нажатию.
+ * Список сопряжённых Bluetooth-устройств с подключением/отключением по нажатию
+ * и выбором вывода звука, когда подключено аудиоустройство.
  * Управляется пультом (D-pad + OK).
  */
 public class MainActivity extends Activity {
@@ -44,13 +45,42 @@ public class MainActivity extends Activity {
     private static final UUID SPP = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB");
     private static final String PERM_CONNECT = "android.permission.BLUETOOTH_CONNECT";
 
+    // Скрытые константы android.media.AudioSystem
+    private static final int FOR_MEDIA = 1;
+    private static final int FORCE_NONE = 0;
+    private static final int FORCE_NO_BT_A2DP = 10;
+
+    private static final int ROW_HEADER = 0;
+    private static final int ROW_OUTPUT = 1; // device == null — встроенный вывод
+    private static final int ROW_DEVICE = 2;
+
+    private static final class Row {
+        final int type;
+        final BluetoothDevice device;
+        final String title;
+
+        Row(int type, BluetoothDevice device, String title) {
+            this.type = type;
+            this.device = device;
+            this.title = title;
+        }
+
+        String key() {
+            return type + ":" + (device != null ? device.getAddress() : title);
+        }
+    }
+
     private final SparseArray<BluetoothProfile> proxies = new SparseArray<BluetoothProfile>();
     private final List<BluetoothDevice> devices = new ArrayList<BluetoothDevice>();
+    private final List<Row> rows = new ArrayList<Row>();
     private final Handler ui = new Handler(Looper.getMainLooper());
 
     private BluetoothAdapter bt;
     private TextView status;
+    private ListView list;
     private DeviceAdapter listAdapter;
+    /** Куда сейчас идёт звук: адрес устройства, "" — встроенный вывод, null — неизвестно. */
+    private String currentOut;
     private boolean receiverRegistered;
 
     private final Runnable refreshTask = new Runnable() {
@@ -100,13 +130,15 @@ public class MainActivity extends Activity {
         status.setText("OK — подключить / отключить");
         root.addView(status);
 
-        ListView list = new ListView(this);
+        list = new ListView(this);
         listAdapter = new DeviceAdapter();
         list.setAdapter(listAdapter);
         list.setOnItemClickListener(new AdapterView.OnItemClickListener() {
             @Override
             public void onItemClick(AdapterView<?> parent, View view, int position, long id) {
-                toggle(devices.get(position));
+                Row row = rows.get(position);
+                if (row.type == ROW_OUTPUT) selectOutput(row.device);
+                else if (row.type == ROW_DEVICE) toggle(row.device);
             }
         });
         root.addView(list, new LinearLayout.LayoutParams(
@@ -156,6 +188,7 @@ public class MainActivity extends Activity {
         f.addAction(BluetoothDevice.ACTION_BOND_STATE_CHANGED);
         f.addAction(BluetoothAdapter.ACTION_STATE_CHANGED);
         f.addAction("android.bluetooth.a2dp.profile.action.CONNECTION_STATE_CHANGED");
+        f.addAction("android.bluetooth.a2dp.profile.action.ACTIVE_DEVICE_CHANGED");
         f.addAction("android.bluetooth.headset.profile.action.CONNECTION_STATE_CHANGED");
         f.addAction("android.bluetooth.input.profile.action.CONNECTION_STATE_CHANGED");
         registerReceiver(receiver, f);
@@ -193,6 +226,9 @@ public class MainActivity extends Activity {
 
     private void refresh() {
         if (bt == null) return;
+        int pos = list.getSelectedItemPosition();
+        String selected = pos >= 0 && pos < rows.size() ? rows.get(pos).key() : null;
+
         devices.clear();
         try {
             if (!bt.isEnabled()) {
@@ -211,7 +247,28 @@ public class MainActivity extends Activity {
                 return name(a).compareToIgnoreCase(name(b));
             }
         });
+
+        rows.clear();
+        List<BluetoothDevice> audio = audioOutputs();
+        currentOut = currentOutput(audio);
+        if (!audio.isEmpty()) { // выбирать есть из чего, только когда подключено аудиоустройство
+            rows.add(new Row(ROW_HEADER, null, "Вывод звука"));
+            rows.add(new Row(ROW_OUTPUT, null, "Встроенный вывод (динамики / HDMI)"));
+            for (BluetoothDevice d : audio) rows.add(new Row(ROW_OUTPUT, d, null));
+            rows.add(new Row(ROW_HEADER, null, "Устройства"));
+        }
+        for (BluetoothDevice d : devices) rows.add(new Row(ROW_DEVICE, d, null));
         listAdapter.notifyDataSetChanged();
+
+        // секция вывода появляется и исчезает — держим выделение на той же строке
+        if (selected != null) {
+            for (int i = 0; i < rows.size(); i++) {
+                if (i != pos && rows.get(i).key().equals(selected)) {
+                    list.setSelection(i);
+                    break;
+                }
+            }
+        }
     }
 
     // ---------- состояние ----------
@@ -349,6 +406,99 @@ public class MainActivity extends Activity {
         }).start();
     }
 
+    // ---------- вывод звука ----------
+
+    /** Сопряжённые устройства с подключённым A2DP — на них можно направить звук. */
+    private List<BluetoothDevice> audioOutputs() {
+        List<BluetoothDevice> out = new ArrayList<BluetoothDevice>();
+        BluetoothProfile a2dp = proxies.get(BluetoothProfile.A2DP);
+        if (a2dp == null) return out;
+        for (BluetoothDevice d : devices) {
+            try {
+                if (a2dp.getConnectionState(d) == BluetoothProfile.STATE_CONNECTED) out.add(d);
+            } catch (Throwable ignored) {
+            }
+        }
+        return out;
+    }
+
+    /** Активное A2DP-устройство (скрытый метод, Android 9+). Исключение — узнать не удалось. */
+    private BluetoothDevice activeA2dp() throws Exception {
+        BluetoothProfile a2dp = proxies.get(BluetoothProfile.A2DP);
+        return (BluetoothDevice) a2dp.getClass().getMethod("getActiveDevice").invoke(a2dp);
+    }
+
+    private String currentOutput(List<BluetoothDevice> audio) {
+        if (audio.isEmpty() || mediaForceUse() == FORCE_NO_BT_A2DP) return "";
+        try {
+            BluetoothDevice active = activeA2dp();
+            return active == null ? "" : active.getAddress();
+        } catch (Throwable ignored) {
+            // до Android 9 метода нет, но и A2DP-устройство там может быть только одно
+            return audio.size() == 1 ? audio.get(0).getAddress() : null;
+        }
+    }
+
+    /** Текущая принудительная маршрутизация медиазвука; -1 — узнать не удалось. */
+    private static int mediaForceUse() {
+        try {
+            Class<?> c = Class.forName("android.media.AudioSystem");
+            return (Integer) c.getMethod("getForceUse", int.class).invoke(null, FOR_MEDIA);
+        } catch (Throwable ignored) {
+            return -1;
+        }
+    }
+
+    /** Скрытый AudioSystem.setForceUse; true — настройка действительно применилась. */
+    private static boolean setMediaForceUse(int config) {
+        try {
+            Class<?> c = Class.forName("android.media.AudioSystem");
+            c.getMethod("setForceUse", int.class, int.class).invoke(null, FOR_MEDIA, config);
+        } catch (Throwable ignored) {
+            return false;
+        }
+        return mediaForceUse() == config;
+    }
+
+    /** Делает устройство активным для звука; true — запрос принят или оно уже активно. */
+    private boolean makeActive(BluetoothDevice d) {
+        try {
+            if (d.equals(activeA2dp())) return true;
+        } catch (Throwable ignored) {
+            if (audioOutputs().size() == 1) return true; // единственное — оно и играет
+        }
+        try { // Android 9–12
+            BluetoothProfile a2dp = proxies.get(BluetoothProfile.A2DP);
+            Method m = a2dp.getClass().getMethod("setActiveDevice", BluetoothDevice.class);
+            if (Boolean.TRUE.equals(m.invoke(a2dp, d))) return true;
+        } catch (Throwable ignored) {
+        }
+        try { // Android 13+; 0 = ACTIVE_DEVICE_AUDIO
+            Method m = BluetoothAdapter.class.getMethod("setActiveDevice", BluetoothDevice.class, int.class);
+            if (Boolean.TRUE.equals(m.invoke(bt, d, 0))) return true;
+        } catch (Throwable ignored) {
+        }
+        return false;
+    }
+
+    /** Направляет звук на устройство; null — на встроенный вывод, не разрывая Bluetooth. */
+    private void selectOutput(BluetoothDevice target) {
+        if (target == null) {
+            status.setText(setMediaForceUse(FORCE_NO_BT_A2DP)
+                    ? "Звук: встроенный вывод (динамики / HDMI)"
+                    : "Прошивка не даёт переключить вывод. Чтобы вернуть звук на динамики / HDMI, "
+                    + "отключите аудиоустройство в списке ниже");
+        } else {
+            boolean routed = mediaForceUse() != FORCE_NO_BT_A2DP || setMediaForceUse(FORCE_NONE);
+            status.setText(routed && makeActive(target)
+                    ? "Звук: " + name(target)
+                    : "Прошивка не даёт переключить звук на " + name(target)
+                    + ". Отключите остальные аудиоустройства — звук перейдёт на оставшееся");
+        }
+        scheduleRefresh(700);
+        ui.postDelayed(refreshTask, 3000);
+    }
+
     // ---------- список ----------
 
     private int dp(int v) {
@@ -358,12 +508,12 @@ public class MainActivity extends Activity {
     private class DeviceAdapter extends BaseAdapter {
         @Override
         public int getCount() {
-            return devices.size();
+            return rows.size();
         }
 
         @Override
         public Object getItem(int position) {
-            return devices.get(position);
+            return rows.get(position);
         }
 
         @Override
@@ -372,18 +522,60 @@ public class MainActivity extends Activity {
         }
 
         @Override
+        public int getViewTypeCount() {
+            return 2;
+        }
+
+        @Override
+        public int getItemViewType(int position) {
+            return rows.get(position).type == ROW_HEADER ? 0 : 1;
+        }
+
+        @Override
+        public boolean areAllItemsEnabled() {
+            return false;
+        }
+
+        @Override
+        public boolean isEnabled(int position) { // заголовки пульт перешагивает
+            return rows.get(position).type != ROW_HEADER;
+        }
+
+        @Override
         public View getView(int position, View convertView, ViewGroup parent) {
+            Row row = rows.get(position);
+            if (row.type == ROW_HEADER) {
+                TextView h = (TextView) convertView;
+                if (h == null) {
+                    h = new TextView(MainActivity.this);
+                    h.setTextSize(14);
+                    h.setTextColor(0xFF9AA0A6);
+                    h.setPadding(dp(16), dp(14), dp(16), dp(4));
+                }
+                h.setText(row.title.toUpperCase());
+                return h;
+            }
+
             View v = convertView;
             if (v == null) {
                 v = getLayoutInflater().inflate(android.R.layout.simple_list_item_2, parent, false);
             }
-            BluetoothDevice d = devices.get(position);
-            String profiles = connectedProfiles(d);
-            boolean on = profiles.length() > 0 || isConnected(d);
             TextView t1 = (TextView) v.findViewById(android.R.id.text1);
             TextView t2 = (TextView) v.findViewById(android.R.id.text2);
-            t1.setText((on ? "●  " : "○  ") + name(d));
             t1.setTextSize(20);
+            BluetoothDevice d = row.device;
+
+            if (row.type == ROW_OUTPUT) {
+                boolean on = (d == null ? "" : d.getAddress()).equals(currentOut);
+                t1.setText((on ? "◉  " : "◯  ") + (d == null ? row.title : name(d)));
+                t2.setText(on ? "звук идёт сюда" : "OK — переключить звук сюда");
+                t2.setTextColor(on ? 0xFF66D17A : 0xFF9AA0A6);
+                return v;
+            }
+
+            String profiles = connectedProfiles(d);
+            boolean on = profiles.length() > 0 || isConnected(d);
+            t1.setText((on ? "●  " : "○  ") + name(d));
             t2.setText(kind(d) + "  ·  "
                     + (on ? "подключено" + (profiles.length() > 0 ? " (" + profiles + ")" : "")
                     : "не подключено")
