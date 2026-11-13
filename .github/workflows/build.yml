@@ -3,6 +3,9 @@ on:
   push:
   workflow_dispatch:
 
+permissions:
+  contents: write # публикация релиза
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -21,8 +24,17 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.10.2'
-      - run: gradle assembleDebug --no-daemon
+      - run: gradle assembleDebug --no-daemon -PversionCode=${{ github.run_number }}
       - uses: actions/upload-artifact@v4
         with:
           name: bt-reconnect-apk
           path: app/build/outputs/apk/debug/app-debug.apk
+      # Релиз с тегом v<номер сборки> — его проверяет приложение, чтобы предложить обновление.
+      - name: Release
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp app/build/outputs/apk/debug/app-debug.apk bt-reconnect.apk
+          gh release create "v${{ github.run_number }}" bt-reconnect.apk \
+            --target "$GITHUB_SHA" --title "Сборка ${{ github.run_number }}" --generate-notes

@@ -1,6 +1,7 @@
 package com.btreconnect;
 
 import android.app.Activity;
+import android.app.PendingIntent;
 import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothClass;
 import android.bluetooth.BluetoothDevice;
@@ -10,6 +11,7 @@ import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.content.pm.PackageInstaller;
 import android.content.pm.PackageManager;
 import android.os.Build;
 import android.os.Bundle;
@@ -24,7 +26,15 @@ import android.widget.LinearLayout;
 import android.widget.ListView;
 import android.widget.TextView;
 
+import org.json.JSONArray;
+import org.json.JSONObject;
+
+import java.io.ByteArrayOutputStream;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.lang.reflect.Method;
+import java.net.HttpURLConnection;
+import java.net.URL;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
@@ -53,6 +63,12 @@ public class MainActivity extends Activity {
     private static final int ROW_HEADER = 0;
     private static final int ROW_OUTPUT = 1; // device == null — встроенный вывод
     private static final int ROW_DEVICE = 2;
+    private static final int ROW_UPDATE = 3;
+
+    /** Свежая сборка публикуется в GitHub Releases с тегом v<versionCode>. */
+    private static final String LATEST_RELEASE =
+            "https://api.github.com/repos/Extrabash/bt-reconnect/releases/latest";
+    private static final String ACTION_INSTALL_STATUS = "com.btreconnect.INSTALL_STATUS";
 
     private static final class Row {
         final int type;
@@ -85,6 +101,11 @@ public class MainActivity extends Activity {
     /** Начатое подключение/отключение, итог которого ещё не показан в строке состояния. */
     private BluetoothDevice pendingDevice;
     private boolean pendingConnect;
+
+    /** Номер сборки, доступной для обновления; 0 — обновления нет. */
+    private int updateBuild;
+    private String updateUrl;
+    private boolean updating;
 
     private final Runnable pendingTimeout = new Runnable() {
         @Override
@@ -148,7 +169,8 @@ public class MainActivity extends Activity {
             @Override
             public void onItemClick(AdapterView<?> parent, View view, int position, long id) {
                 Row row = rows.get(position);
-                if (row.type == ROW_OUTPUT) selectOutput(row.device);
+                if (row.type == ROW_UPDATE) installUpdate();
+                else if (row.type == ROW_OUTPUT) selectOutput(row.device);
                 else if (row.type == ROW_DEVICE) toggle(row.device);
             }
         });
@@ -156,6 +178,8 @@ public class MainActivity extends Activity {
                 ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
         setContentView(root);
         list.requestFocus();
+
+        checkUpdate();
 
         bt = BluetoothAdapter.getDefaultAdapter();
         if (bt == null) {
@@ -262,6 +286,9 @@ public class MainActivity extends Activity {
         });
 
         rows.clear();
+        if (updateBuild > 0) {
+            rows.add(new Row(ROW_UPDATE, null, "Доступно обновление (сборка " + updateBuild + ")"));
+        }
         List<BluetoothDevice> audio = audioOutputs();
         currentOut = currentOutput(audio);
         if (!audio.isEmpty()) { // выбирать есть из чего, только когда подключено аудиоустройство
@@ -572,6 +599,135 @@ public class MainActivity extends Activity {
         ui.postDelayed(refreshTask, 3000);
     }
 
+    // ---------- обновление ----------
+
+    private int ownBuild() {
+        try {
+            return getPackageManager().getPackageInfo(getPackageName(), 0).versionCode;
+        } catch (Throwable ignored) {
+            return Integer.MAX_VALUE;
+        }
+    }
+
+    private static HttpURLConnection open(String url) throws Exception {
+        HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
+        c.setConnectTimeout(10000);
+        c.setReadTimeout(30000);
+        return c;
+    }
+
+    /** Тихо проверяет, есть ли сборка новее установленной; нет сети — просто не предлагаем. */
+    private void checkUpdate() {
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    HttpURLConnection c = open(LATEST_RELEASE);
+                    ByteArrayOutputStream body = new ByteArrayOutputStream();
+                    InputStream in = c.getInputStream();
+                    try {
+                        copy(in, body);
+                    } finally {
+                        in.close();
+                    }
+                    JSONObject release = new JSONObject(body.toString("UTF-8"));
+                    final int build = Integer.parseInt(release.getString("tag_name").replaceAll("\\D", ""));
+                    if (build <= ownBuild()) return;
+                    JSONArray assets = release.getJSONArray("assets");
+                    for (int i = 0; i < assets.length(); i++) {
+                        final String url = assets.getJSONObject(i).getString("browser_download_url");
+                        if (!url.endsWith(".apk")) continue;
+                        ui.post(new Runnable() {
+                            @Override
+                            public void run() {
+                                updateBuild = build;
+                                updateUrl = url;
+                                refresh();
+                            }
+                        });
+                        return;
+                    }
+                } catch (Throwable ignored) {
+                }
+            }
+        }).start();
+    }
+
+    private static void copy(InputStream in, OutputStream out) throws Exception {
+        byte[] buf = new byte[16384];
+        for (int n; (n = in.read(buf)) > 0; ) out.write(buf, 0, n);
+    }
+
+    /** Скачивает APK прямо в сессию установщика; дальше система спросит подтверждение. */
+    private void installUpdate() {
+        if (updating) return;
+        updating = true;
+        status.setText("Скачиваю обновление…");
+        final String url = updateUrl;
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                String error = null;
+                try {
+                    PackageInstaller installer = getPackageManager().getPackageInstaller();
+                    PackageInstaller.SessionParams params = new PackageInstaller.SessionParams(
+                            PackageInstaller.SessionParams.MODE_FULL_INSTALL);
+                    params.setAppPackageName(getPackageName());
+                    PackageInstaller.Session session = installer.openSession(installer.createSession(params));
+                    try {
+                        InputStream in = open(url).getInputStream();
+                        OutputStream out = session.openWrite("update.apk", 0, -1);
+                        try {
+                            copy(in, out);
+                            session.fsync(out);
+                        } finally {
+                            out.close();
+                            in.close();
+                        }
+                        Intent result = new Intent(MainActivity.this, MainActivity.class)
+                                .setAction(ACTION_INSTALL_STATUS);
+                        session.commit(PendingIntent.getActivity(MainActivity.this, 0, result,
+                                PendingIntent.FLAG_UPDATE_CURRENT).getIntentSender());
+                    } catch (Throwable t) {
+                        session.abandon();
+                        throw t;
+                    } finally {
+                        session.close();
+                    }
+                } catch (Throwable t) {
+                    error = t.getMessage() != null ? t.getMessage() : t.getClass().getSimpleName();
+                }
+                final String failed = error;
+                ui.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        updating = false;
+                        status.setText(failed == null ? "Обновление скачано, подтвердите установку"
+                                : "Не удалось скачать обновление: " + failed);
+                    }
+                });
+            }
+        }).start();
+    }
+
+    /** Ответ установщика: запрос подтверждения у пользователя или итог установки. */
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        if (!ACTION_INSTALL_STATUS.equals(intent.getAction())) return;
+        int result = intent.getIntExtra(PackageInstaller.EXTRA_STATUS, PackageInstaller.STATUS_FAILURE);
+        if (result == PackageInstaller.STATUS_PENDING_USER_ACTION) {
+            try {
+                startActivity((Intent) intent.getParcelableExtra(Intent.EXTRA_INTENT));
+            } catch (Throwable t) {
+                status.setText("Не удалось открыть установщик");
+            }
+        } else if (result != PackageInstaller.STATUS_SUCCESS) {
+            String why = intent.getStringExtra(PackageInstaller.EXTRA_STATUS_MESSAGE);
+            status.setText("Обновление не установлено" + (why != null ? ": " + why : ""));
+        }
+    }
+
     // ---------- список ----------
 
     private int dp(int v) {
@@ -637,6 +793,13 @@ public class MainActivity extends Activity {
             TextView t2 = (TextView) v.findViewById(android.R.id.text2);
             t1.setTextSize(20);
             BluetoothDevice d = row.device;
+
+            if (row.type == ROW_UPDATE) {
+                t1.setText("↓  " + row.title);
+                t2.setText("OK — скачать и установить");
+                t2.setTextColor(0xFF66D17A);
+                return v;
+            }
 
             if (row.type == ROW_OUTPUT) {
                 boolean on = (d == null ? "" : d.getAddress()).equals(currentOut);
